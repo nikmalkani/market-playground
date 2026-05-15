@@ -5,9 +5,11 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -27,6 +29,31 @@ from .tracking import (
 _PROD_SHARE_DB_URL_ENV = "STRATEGY_SHARE_DB_URL"
 _PROD_SHARE_DB_DEFAULT_URL = "sqlite:///strategy_shares.db"
 _MAX_STRATEGY_SHARE_BODY_BYTES = 1_500_000
+_MAX_CONTRACT_LIMIT = 2_000
+_MAX_STRATEGY_PLAN_DATES = 750
+_METADATA_CACHE_TTL_SECONDS = 300
+
+_OPTION_DB_PERFORMANCE_INDEXES = (
+    """
+    CREATE INDEX IF NOT EXISTS ix_spx_option_snapshots_symbol_streamer_ts
+    ON spx_option_snapshots (symbol, streamer_symbol, snapshot_ts)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_spx_option_snapshots_symbol_type_dte_ts
+    ON spx_option_snapshots (symbol, option_type, dte, snapshot_ts)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_spx_option_snapshots_symbol_snapshot_date
+    ON spx_option_snapshots (symbol, date(snapshot_ts))
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_spx_option_snapshots_symbol_option_type
+    ON spx_option_snapshots (symbol, option_type)
+    """,
+)
+
+_METADATA_CACHE_LOCK = threading.Lock()
+_METADATA_CACHE: dict[tuple[str, str, int], tuple[float, dict[str, Any]]] = {}
 
 
 def _resolve_sqlite_path(db_url: str) -> Path:
@@ -74,6 +101,64 @@ def _html_response(handler: BaseHTTPRequestHandler, html: str) -> None:
 
 def _render_app_html(*, tracking_enabled: bool) -> str:
     return _HTML.replace("__TRACKING_ENABLED__", "true" if tracking_enabled else "false")
+
+
+def _connect_options_db(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -64000")
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
+def ensure_option_query_performance(db_path: Path) -> None:
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        for statement in _OPTION_DB_PERFORMANCE_INDEXES:
+            conn.execute(statement)
+        conn.execute("PRAGMA optimize")
+        conn.commit()
+
+
+def _sqlite_cache_version(db_path: Path) -> int:
+    versions = [db_path.stat().st_mtime_ns]
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{db_path}{suffix}")
+        try:
+            versions.append(sidecar.stat().st_mtime_ns)
+        except FileNotFoundError:
+            pass
+    return max(versions)
+
+
+def _cached_metadata_payload(
+    db_path: Path,
+    cache_key: str,
+    builder: Any,
+) -> dict[str, Any]:
+    version = _sqlite_cache_version(db_path)
+    key = (str(db_path), cache_key, version)
+    now = monotonic()
+    with _METADATA_CACHE_LOCK:
+        cached = _METADATA_CACHE.get(key)
+        if cached is not None and now - cached[0] <= _METADATA_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    with _connect_options_db(db_path) as conn:
+        payload = builder(conn)
+
+    with _METADATA_CACHE_LOCK:
+        stale_keys = [
+            existing_key
+            for existing_key in _METADATA_CACHE
+            if existing_key[0] == key[0] and existing_key[1] == key[1]
+        ]
+        for stale_key in stale_keys:
+            _METADATA_CACHE.pop(stale_key, None)
+        _METADATA_CACHE[key] = (now, payload)
+    return payload
 
 
 def _schema_payload(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -257,8 +342,8 @@ def _run_resolve_leg_payload(
     if effective_side and effective_side not in {"BUY", "SELL"}:
         raise ValueError("target_side must be BUY or SELL.")
 
-    latest_date = _resolve_latest_option_date(conn, symbol)
     if entry_date is None:
+        latest_date = _resolve_latest_option_date(conn, symbol)
         if latest_date is None:
             raise ValueError("No option snapshots found for this symbol.")
         entry_date = latest_date
@@ -408,6 +493,7 @@ def _run_contracts_payload(
     max_strike: float | None = None,
     limit: int = 400,
 ) -> dict[str, Any]:
+    limit = max(1, min(limit, _MAX_CONTRACT_LIMIT))
     clauses = ["symbol = ?"]
     params: list[Any] = [symbol]
 
@@ -602,7 +688,7 @@ def _parse_strategy_leg_payload(value: Any, index: int) -> dict[str, Any]:
     if option_type not in {"PUT", "CALL"}:
         raise ValueError(f"leg[{index}] option_type must be PUT or CALL.")
 
-    dte = _parse_int(str(value.get("dte")), "leg.dte")
+    dte = _parse_int_required(str(value.get("dte")), "leg.dte")
     if dte < 0:
         raise ValueError(f"leg[{index}] dte must be >= 0.")
 
@@ -612,7 +698,7 @@ def _parse_strategy_leg_payload(value: Any, index: int) -> dict[str, Any]:
         raise ValueError(f"leg[{index}] entry_time is required.")
     _parse_est_hhmm(entry_time, f"leg[{index}].entry_time")
 
-    quantity = _parse_int(str(value.get("quantity", "1")), "leg.quantity")
+    quantity = _parse_int(str(value.get("quantity", "1")), "leg.quantity", 1)
     if quantity <= 0:
         raise ValueError(f"leg[{index}] quantity must be > 0.")
 
@@ -623,6 +709,120 @@ def _parse_strategy_leg_payload(value: Any, index: int) -> dict[str, Any]:
         "target_delta": target_delta,
         "entry_time": entry_time,
         "quantity": quantity,
+    }
+
+
+def _parse_strategy_plan_leg_payload(value: Any, index: int) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"leg[{index}] must be an object.")
+    normalized = dict(value)
+    if "dte" not in normalized and "target_dte" in normalized:
+        normalized["dte"] = normalized["target_dte"]
+    return _parse_strategy_leg_payload(normalized, index)
+
+
+def _parse_strategy_plan_dates(value: Any) -> list[date]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("trade_dates must be a non-empty array.")
+    if len(value) > _MAX_STRATEGY_PLAN_DATES:
+        raise ValueError(f"At most {_MAX_STRATEGY_PLAN_DATES} trade dates are supported.")
+
+    dates: list[date] = []
+    seen: set[date] = set()
+    for index, item in enumerate(value):
+        parsed = _parse_date(str(item), f"trade_dates[{index}]")
+        if parsed is None:
+            raise ValueError(f"trade_dates[{index}] is required.")
+        if parsed in seen:
+            continue
+        seen.add(parsed)
+        dates.append(parsed)
+    dates.sort()
+    return dates
+
+
+def _run_strategy_plan_payload(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    legs: list[dict[str, Any]],
+    trade_dates: list[date],
+    window_minutes: int = 5,
+) -> dict[str, Any]:
+    if not legs:
+        raise ValueError("At least one strategy leg is required.")
+    if not trade_dates:
+        raise ValueError("At least one trade date is required.")
+    if window_minutes <= 0:
+        raise ValueError("window_minutes must be > 0.")
+
+    trade_plans: list[dict[str, Any]] = []
+    skipped_dates = 0
+    for trade_date in trade_dates:
+        plan_legs: list[dict[str, Any]] = []
+        for leg in legs:
+            try:
+                resolved = _run_resolve_leg_payload(
+                    conn,
+                    symbol=symbol,
+                    option_type=leg["option_type"],
+                    dte=leg["dte"],
+                    target_delta=leg["target_delta"],
+                    entry_time=leg["entry_time"],
+                    entry_date=trade_date,
+                    target_side=leg["side"],
+                    window_minutes=window_minutes,
+                    strict_dte=True,
+                    best_only=True,
+                )
+            except ValueError:
+                plan_legs = []
+                break
+
+            streamer = resolved.get("streamer_symbol")
+            if not streamer:
+                plan_legs = []
+                break
+
+            plan_legs.append(
+                {
+                    "leg_def": {
+                        "side": leg["side"],
+                        "quantity": leg["quantity"],
+                        "option_type": leg["option_type"],
+                        "target_delta": leg["target_delta"],
+                        "target_dte": leg["dte"],
+                        "entry_time": leg["entry_time"],
+                    },
+                    "sign": -1 if leg["side"] == "SELL" else 1,
+                    "quantity": leg["quantity"],
+                    "streamer_symbol": streamer,
+                    "entry_snapshot_ts": resolved.get("snapshot_ts"),
+                    "contract": {
+                        "streamer_symbol": streamer,
+                        "option_type": resolved.get("option_type"),
+                        "strike_price": resolved.get("strike_price"),
+                        "expiration_date": resolved.get("expiration_date"),
+                    },
+                }
+            )
+
+        if len(plan_legs) != len(legs):
+            skipped_dates += 1
+            continue
+
+        trade_plans.append(
+            {
+                "trade_index": len(trade_plans) + 1,
+                "trade_date": str(trade_date),
+                "legs": plan_legs,
+            }
+        )
+
+    return {
+        "trade_plans": trade_plans,
+        "skipped_dates": skipped_dates,
+        "trade_dates_count": len(trade_dates),
     }
 
 
@@ -711,7 +911,7 @@ def _run_strategy_history_payload(
                     SELECT
                         snapshot_ts,
                         COALESCE(mid_price, (bid_price + ask_price) / 2.0) AS value
-                    FROM spx_option_snapshots
+                    FROM spx_option_snapshots INDEXED BY ix_spx_option_snapshots_symbol_streamer_ts
                     WHERE symbol = ?
                       AND streamer_symbol = ?
                       AND snapshot_ts >= ?
@@ -1062,7 +1262,7 @@ class SqlUiHandler(BaseHTTPRequestHandler):
                 _error_response(self, str(exc))
             return
         if path == "/api/schema":
-            with sqlite3.connect(self.db_path) as conn:
+            with _connect_options_db(self.db_path) as conn:
                 payload = _schema_payload(conn)
             _json_response(self, payload)
             return
@@ -1075,8 +1275,7 @@ class SqlUiHandler(BaseHTTPRequestHandler):
                 min_strike = _parse_float(_get_qs(qs, "min_strike"), "min_strike")
                 max_strike = _parse_float(_get_qs(qs, "max_strike"), "max_strike")
                 limit = _parse_int(_get_qs(qs, "limit"), "limit", 400)
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
+                with _connect_options_db(self.db_path) as conn:
                     payload = _run_contracts_payload(
                         conn,
                         symbol=symbol or "SPX",
@@ -1101,8 +1300,7 @@ class SqlUiHandler(BaseHTTPRequestHandler):
                 start_dt = _parse_datetime(_get_qs(qs, "from"), "from")
                 end_dt = _parse_datetime(_get_qs(qs, "to"), "to")
                 field = _get_qs(qs, "field", "mid_price")
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
+                with _connect_options_db(self.db_path) as conn:
                     payload = _run_series_payload(
                         conn,
                         symbol=symbol or "SPX",
@@ -1120,8 +1318,7 @@ class SqlUiHandler(BaseHTTPRequestHandler):
                 symbol = _get_qs(qs, "symbol", "SPX")
                 start_dt = _parse_datetime(_get_qs(qs, "from"), "from")
                 end_dt = _parse_datetime(_get_qs(qs, "to"), "to")
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
+                with _connect_options_db(self.db_path) as conn:
                     payload = _run_summary_payload(
                         conn, symbol=symbol or "SPX", start_dt=start_dt, end_dt=end_dt
                     )
@@ -1132,11 +1329,14 @@ class SqlUiHandler(BaseHTTPRequestHandler):
         if path == "/api/options/snapshot-dates":
             try:
                 symbol = _get_qs(qs, "symbol", "SPX")
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    payload = _run_snapshot_dates_payload(
-                        conn, symbol=symbol or "SPX"
-                    )
+                effective_symbol = symbol or "SPX"
+                payload = _cached_metadata_payload(
+                    self.db_path,
+                    f"snapshot-dates:{effective_symbol}",
+                    lambda conn: _run_snapshot_dates_payload(
+                        conn, symbol=effective_symbol
+                    ),
+                )
                 _json_response(self, payload)
             except Exception as exc:
                 _error_response(self, str(exc))
@@ -1144,11 +1344,14 @@ class SqlUiHandler(BaseHTTPRequestHandler):
         if path == "/api/options/option-types":
             try:
                 symbol = _get_qs(qs, "symbol", "SPX")
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    payload = _run_option_types_payload(
-                        conn, symbol=symbol or "SPX"
-                    )
+                effective_symbol = symbol or "SPX"
+                payload = _cached_metadata_payload(
+                    self.db_path,
+                    f"option-types:{effective_symbol}",
+                    lambda conn: _run_option_types_payload(
+                        conn, symbol=effective_symbol
+                    ),
+                )
                 _json_response(self, payload)
             except Exception as exc:
                 _error_response(self, str(exc))
@@ -1171,8 +1374,7 @@ class SqlUiHandler(BaseHTTPRequestHandler):
                 strict_dte = strict_dte_raw in {"1", "true", "yes", "on"}
                 best_only_raw = (_get_qs(qs, "best_only") or "").strip().lower()
                 best_only = best_only_raw in {"1", "true", "yes", "on"}
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
+                with _connect_options_db(self.db_path) as conn:
                     payload = _run_resolve_leg_payload(
                         conn,
                         symbol=symbol or "SPX",
@@ -1199,6 +1401,7 @@ class SqlUiHandler(BaseHTTPRequestHandler):
         path, _ = _get_query_params(self.path)
         if path not in {
             "/api/options/strategy-history",
+            "/api/options/strategy-plan",
             "/api/track",
             "/api/strategy-shares",
         }:
@@ -1235,6 +1438,30 @@ class SqlUiHandler(BaseHTTPRequestHandler):
                 _json_response(self, payload, status=201)
                 return
 
+            if path == "/api/options/strategy-plan":
+                payload_legs_raw = parsed.get("legs")
+                if not isinstance(payload_legs_raw, list):
+                    raise ValueError("legs must be an array.")
+                legs = [
+                    _parse_strategy_plan_leg_payload(leg, i)
+                    for i, leg in enumerate(payload_legs_raw)
+                ]
+                trade_dates = _parse_strategy_plan_dates(parsed.get("trade_dates"))
+                symbol = str(parsed.get("symbol", "SPX"))
+                window_minutes = _parse_int(
+                    str(parsed.get("window_minutes", "5")), "window_minutes", 5
+                )
+                with _connect_options_db(self.db_path) as conn:
+                    payload = _run_strategy_plan_payload(
+                        conn,
+                        symbol=symbol or "SPX",
+                        legs=legs,
+                        trade_dates=trade_dates,
+                        window_minutes=window_minutes,
+                    )
+                _json_response(self, payload)
+                return
+
             payload_legs_raw = parsed.get("legs")
             if not isinstance(payload_legs_raw, list):
                 raise ValueError("legs must be an array.")
@@ -1243,10 +1470,11 @@ class SqlUiHandler(BaseHTTPRequestHandler):
             start = _parse_date(parsed.get("from"), "from")
             end = _parse_date(parsed.get("to"), "to")
             symbol = str(parsed.get("symbol", "SPX"))
-            window_minutes = _parse_int(parsed.get("window_minutes"), "window_minutes", 5)
+            window_minutes = _parse_int(
+                str(parsed.get("window_minutes", "5")), "window_minutes", 5
+            )
 
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
+            with _connect_options_db(self.db_path) as conn:
                 payload = _run_strategy_history_payload(
                     conn,
                     symbol=symbol or "SPX",
@@ -1280,6 +1508,7 @@ def main() -> None:
     db_path = _resolve_sqlite_path(settings.db_url)
     if not db_path.exists():
         raise FileNotFoundError(f"SQLite DB not found at {db_path}")
+    ensure_option_query_performance(db_path)
     share_db_path = ensure_strategy_share_db(_share_db_url())
     tracking_db_path = None
     if settings.tracking_enabled or settings.tracking_metrics_enabled:
@@ -2271,6 +2500,7 @@ _HTML = """<!doctype html>
     const MAX_ANALYZER_SELECTED_CONTRACTS = 4;
     const MAX_STRATEGY_RESOLVED_CONTRACTS = 50;
     const MAX_STRATEGY_ANALYSIS_STREAMERS = 120;
+    const MAX_TABLE_RENDER_ROWS = 1000;
     const MINUTE_DIFF_LABEL = 60;
     const TRACKING_ENABLED = __TRACKING_ENABLED__;
     const TRACKING_ANON_KEY = "marketplayground_tracking_anonymous_id";
@@ -2505,7 +2735,7 @@ _HTML = """<!doctype html>
       if (!value) return null;
       const raw = String(value).trim();
       if (!raw) return null;
-      const hasZone = /Z$|[+-]\d\d:\d\d$/.test(raw);
+      const hasZone = /Z$|[+-]\\d\\d:\\d\\d$/.test(raw);
       const normalized = hasZone ? raw : raw.replace(" ", "T") + "Z";
       const d = new Date(normalized);
       return Number.isNaN(d.getTime()) ? null : d;
@@ -2567,7 +2797,7 @@ _HTML = """<!doctype html>
     }
 
     function formatMobileStrategyDateDisplay(value) {
-      if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(String(value))) return "";
+      if (!value || !/^\\d{4}-\\d{2}-\\d{2}$/.test(String(value))) return "";
       const [year, month, day] = String(value).split("-").map((part) => Number(part));
       const date = new Date(Date.UTC(year, month - 1, day));
       return new Intl.DateTimeFormat("en-US", {
@@ -2579,7 +2809,7 @@ _HTML = """<!doctype html>
     }
 
     function formatMobileStrategyTimeDisplay(value) {
-      if (!value || !/^\d{2}:\d{2}$/.test(String(value))) return "";
+      if (!value || !/^\\d{2}:\\d{2}$/.test(String(value))) return "";
       const [hours, minutes] = String(value).split(":").map((part) => Number(part));
       const date = new Date(Date.UTC(2000, 0, 1, hours, minutes));
       return new Intl.DateTimeFormat("en-US", {
@@ -2606,7 +2836,7 @@ _HTML = """<!doctype html>
 
     function parseHmToMinutes(value) {
       const raw = String(value || "").trim();
-      const match = raw.match(/^(\d{2}):(\d{2})$/);
+      const match = raw.match(/^(\\d{2}):(\\d{2})$/);
       if (!match) return null;
       const hours = Number(match[1]);
       const minutes = Number(match[2]);
@@ -3157,7 +3387,7 @@ _HTML = """<!doctype html>
         const tradeStartTs = entryTimes.length ? new Date(Math.max(...entryTimes)) : null;
         const expirations = legs
           .map((leg) => String(leg.contract && leg.contract.expiration_date ? leg.contract.expiration_date : ""))
-          .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+          .filter((value) => /^\\d{4}-\\d{2}-\\d{2}$/.test(value))
           .sort();
         const strategyExpirationYmd = expirations.length ? expirations[0] : "";
         return { ...trade, legs, trade_start_ts: tradeStartTs, strategy_expiration_ymd: strategyExpirationYmd };
@@ -3259,9 +3489,17 @@ _HTML = """<!doctype html>
 
     function renderStrategySeriesTable(rows) {
       const body = document.querySelector("#strategySeriesTable tbody");
+      const meta = document.getElementById("strategySeriesMeta");
       if (!body) return;
       body.innerHTML = "";
-      rows.forEach((row) => {
+      const allRows = Array.isArray(rows) ? rows : [];
+      const visibleRows = allRows.slice(0, MAX_TABLE_RENDER_ROWS);
+      if (meta) {
+        meta.textContent = allRows.length > visibleRows.length
+          ? `Showing first ${visibleRows.length} of ${allRows.length} rows. Chart, stats, and sharing use the full result set.`
+          : `${allRows.length} rows.`;
+      }
+      visibleRows.forEach((row) => {
         const spread = row.isStrategySummary
           ? null
           : (row.bid_price == null || row.ask_price == null ? null : Number(row.ask_price) - Number(row.bid_price));
@@ -3558,7 +3796,7 @@ _HTML = """<!doctype html>
     }
 
     function dateUtcFromYmd(ymd) {
-      if (!ymd || !/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+      if (!ymd || !/^\\d{4}-\\d{2}-\\d{2}$/.test(ymd)) return null;
       const [yy, mm, dd] = ymd.split("-").map((v) => Number(v));
       if (!Number.isFinite(yy) || !Number.isFinite(mm) || !Number.isFinite(dd)) return null;
       return Date.UTC(yy, mm - 1, dd);
@@ -4171,55 +4409,39 @@ _HTML = """<!doctype html>
       }
 
       try {
-        const tradePlans = [];
-        let skippedDates = 0;
-        for (const tradeDate of tradeDates) {
-          const legResults = await Promise.all(
-            resolvedLegs.map(async (leg) => {
-              const params = new URLSearchParams({
-                symbol,
-                option_type: String(leg.option_type || "PUT"),
-                dte: String(Number(leg.target_dte)),
-                target_delta: String(Number(leg.target_delta)),
-                entry_time: String(leg.entry_time || ""),
-                entry_date: tradeDate,
-                target_side: String(leg.side || "BUY"),
-                window_minutes: "5",
-                strict_dte: "1",
-                best_only: "1",
-              });
-              const res = await fetch(`/api/options/resolve-leg?${params.toString()}`);
-              const payload = await res.json();
-              if (!res.ok) return null;
-              const contracts = Array.isArray(payload.contracts) ? payload.contracts : (payload.streamer_symbol ? [payload] : []);
-              if (!contracts.length) return null;
-              const best = contracts[0];
-              return {
-                leg_def: leg,
-                sign: leg.side === "SELL" ? -1 : 1,
-                quantity: Number(leg.quantity) > 0 ? Number(leg.quantity) : 1,
-                streamer_symbol: best.streamer_symbol,
-                entry_snapshot_ts: best.snapshot_ts,
-                contract: {
-                  streamer_symbol: best.streamer_symbol,
-                  option_type: best.option_type,
-                  strike_price: best.strike_price,
-                  expiration_date: best.expiration_date,
-                },
-              };
-            })
-          );
-          const legs = legResults.filter(Boolean);
-          if (legs.length !== resolvedLegs.length) {
-            skippedDates += 1;
-            continue;
-          }
-          tradePlans.push({
-            trade_index: tradePlans.length + 1,
-            trade_date: tradeDate,
-            legs,
+        const planRes = await fetch("/api/options/strategy-plan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol,
+            trade_dates: tradeDates,
+            window_minutes: 5,
+            legs: resolvedLegs.map((leg) => ({
+              side: String(leg.side || "BUY"),
+              quantity: Number(leg.quantity) > 0 ? Number(leg.quantity) : 1,
+              option_type: String(leg.option_type || "PUT"),
+              dte: Number(leg.target_dte),
+              target_delta: Number(leg.target_delta),
+              entry_time: String(leg.entry_time || ""),
+            })),
+          }),
+        });
+        const planPayload = await planRes.json();
+        if (!planRes.ok) {
+          setStrategyResultsVisibility(false);
+          meta.textContent = "Error resolving daily trades: " + (planPayload.error || "unknown");
+          meta.className = "meta danger";
+          renderStrategyStats([]);
+          renderStrategySeriesTable([]);
+          renderStrategyIndexChart([]);
+          trackStrategyRunResult("error", {
+            reason: planPayload.error || "strategy_plan_error",
+            trade_dates_count: tradeDates.length,
           });
+          return;
         }
+        const tradePlans = Array.isArray(planPayload.trade_plans) ? planPayload.trade_plans : [];
+        const skippedDates = Number(planPayload.skipped_dates) || 0;
         if (!tradePlans.length) {
           setStrategyResultsVisibility(false);
           meta.textContent = "No daily trades could be opened at the requested entry time/delta in this range.";
@@ -4896,7 +5118,8 @@ _HTML = """<!doctype html>
     function renderAnalyzerSeriesTable(rows) {
       const body = document.querySelector("#analyzerSeriesTable tbody");
       body.innerHTML = "";
-      rows.forEach((row) => {
+      const visibleRows = (Array.isArray(rows) ? rows : []).slice(0, MAX_TABLE_RENDER_ROWS);
+      visibleRows.forEach((row) => {
         const spread = row.spread == null ? "" : Number(row.spread).toFixed(4);
         const tr = document.createElement("tr");
         tr.innerHTML = `
@@ -5010,7 +5233,8 @@ _HTML = """<!doctype html>
     function renderAnalyzerStrategySeriesTable(rows) {
       const body = document.querySelector("#analyzerStrategySeriesTable tbody");
       body.innerHTML = "";
-      rows.forEach((row) => {
+      const visibleRows = (Array.isArray(rows) ? rows : []).slice(0, MAX_TABLE_RENDER_ROWS);
+      visibleRows.forEach((row) => {
         const spread = row.bid_price == null || row.ask_price == null ? "" : (Number(row.ask_price) - Number(row.bid_price)).toFixed(4);
         const strategy = row.strategy_price == null ? "" : Number(row.strategy_price).toFixed(4);
         const strategyCost = row.strategy_cost == null ? "" : Number(row.strategy_cost).toFixed(4);
@@ -5074,7 +5298,9 @@ _HTML = """<!doctype html>
 
       const transformed = transformAnalyzerRows(rows, summaryData.market_series || []);
       renderAnalyzerSeriesTable(transformed);
-      meta.textContent = `Loaded ${streamers.length} contracts, ${rows.length} rows.`;
+      meta.textContent = rows.length > MAX_TABLE_RENDER_ROWS
+        ? `Loaded ${streamers.length} contracts, ${rows.length} rows. Showing first ${MAX_TABLE_RENDER_ROWS} table rows.`
+        : `Loaded ${streamers.length} contracts, ${rows.length} rows.`;
       meta.className = "meta success";
     }
 
@@ -5128,7 +5354,9 @@ _HTML = """<!doctype html>
 
       const transformed = transformAnalyzerStrategyRows(rows, summaryData.market_series || []);
       renderAnalyzerStrategySeriesTable(transformed);
-      meta.textContent = `Loaded ${usableLegs.length} strategy legs, ${rows.length} rows.`;
+      meta.textContent = rows.length > MAX_TABLE_RENDER_ROWS
+        ? `Loaded ${usableLegs.length} strategy legs, ${rows.length} rows. Showing first ${MAX_TABLE_RENDER_ROWS} table rows.`
+        : `Loaded ${usableLegs.length} strategy legs, ${rows.length} rows.`;
       meta.className = "meta success";
     }
 
