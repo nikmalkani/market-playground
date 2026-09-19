@@ -172,6 +172,18 @@ This bypasses the scheduler window and runs a full collection pass once:
 python -c "import asyncio; from spx_collector.config import Settings; from spx_collector.db import build_session_factory; from spx_collector.collector import SPXCollector; s=Settings(); sf=build_session_factory(s.db_url); db=sf(); n=asyncio.run(SPXCollector(s).run_snapshot(db)); db.close(); print('FORCED_INSERTED=', n)"
 ```
 
+## SQLite Backup
+
+The backup timer maintains one file at `backups/sqlite/spx_options.db.backup`. The first run creates a consistent SQLite backup; later runs append rows with IDs newer than the backup's high-water mark in each snapshot table. It does not create a full dated copy every day. The snapshot tables are append-only; schema mismatches fail loudly rather than producing a misleading backup.
+
+Run it manually with:
+
+```bash
+./scripts/backup_sqlite.sh
+```
+
+Keep the backup file on a separate disk or object store for disaster recovery. This local single-file mirror is not a substitute for an off-host backup.
+
 ## Deployment Shape
 
 The public deployment path looks like this:
