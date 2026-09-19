@@ -51,6 +51,8 @@ sudo systemctl enable --now spx-sqlite-backup.timer
 
 ```bash
 sudo cp deploy/caddy/public-site.example.Caddyfile /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl enable --now caddy
 sudo systemctl reload caddy
 ```
 
