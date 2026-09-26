@@ -28,10 +28,3 @@ class Settings(BaseSettings):
     collector_debug_sample_events: int = Field(
         default=3, alias="COLLECTOR_DEBUG_SAMPLE_EVENTS", ge=1
     )
-    tracking_db_url: str = Field(
-        default="sqlite:///site_tracking.db", alias="TRACKING_DB_URL"
-    )
-    tracking_enabled: bool = Field(default=False, alias="TRACKING_ENABLED")
-    tracking_metrics_enabled: bool = Field(
-        default=True, alias="TRACKING_METRICS_ENABLED"
-    )

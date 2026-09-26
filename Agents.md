@@ -8,12 +8,12 @@
 ## UI Tabs Not Loading: Root Cause + Prevention
 
 ### What failed
-- `Options Analyzer` and `SQL Lab` did not load because inline JS in `_HTML` failed to parse.
+- `Options Analyzer` did not load because inline JS in `_HTML` failed to parse.
 - Browser showed: `Uncaught SyntaxError: Invalid or unexpected token (index):503`.
 - The syntax error prevented tab init/bind code from running at all.
 
 ### Why it happened
-- The UI is embedded in Python as a triple-quoted string (`_HTML` in the backtest entry files like `backtest_dev.py`, `backtest_staging.py`, and `backtest_prod.py`).
+- The UI is embedded in Python as a triple-quoted string (`_HTML` in `backtest_prod.py`).
 - JS escape sequences like `"\n"` inside that Python string can become literal newlines in served JS if not escaped correctly for this embedding context.
 - Some modern JS constructs can also cause compatibility/parser issues depending on browser/runtime.
 
@@ -27,11 +27,11 @@
 ### Operational gotcha
 - Hard refresh is not enough after editing `_HTML` in Python.
 - You must restart the running backtest process after editing `_HTML` so the updated page is served.
-- In this repo that usually means restarting whichever script you launched: `backtest_dev.py`, `backtest_staging.py`, or `backtest_prod.py`.
+- Restart the local `backtest_prod.py` process after editing `_HTML`.
 
 ### Quick troubleshooting checklist
 1. Open browser console and check first syntax error line in `(index)`.
-2. Map that line to `_HTML` line numbers in the active backtest file under `src/spx_collector/`, usually `backtest_dev.py`, `backtest_staging.py`, or `backtest_prod.py`.
+2. Map that line to `_HTML` in `src/spx_collector/backtest_prod.py`.
 3. Check for Python-string escape interactions in inline JS (`\n`, `\t`, etc.).
 4. If parse error exists, assume tab code never initialized; fix parse error first.
 5. Restart backend process after each `_HTML` edit before re-testing.
@@ -72,12 +72,10 @@ code --new-window --remote ssh-remote+your-host-alias /path/to/project
 ssh -i /path/to/private-key user@your-server-ip
 ```
 
-## Backtest UI Port Defaults
-- `backtest_dev.py` default port: `8787`
-- `backtest_staging.py` default port: `8788`
-- `backtest_prod.py` default port: `8789`
-
-Use `--port` to override when needed, but keep this mapping as the standard to avoid collisions.
+## Local App
+- Run `PYTHONPATH=src python -m spx_collector.backtest_prod --host 127.0.0.1 --port 8789` for local review.
+- The app requires `.env` permissions of `600`; use `chmod 600 .env`.
+- Point `DB_URL` at a local SQLite database. The production service uses the same app module on its own host and database.
 
 ## Cross-Project Rules
 - Do not hardcode time zone offsets for civil/business time. Use UTC for storage and named IANA zones for conversion.
@@ -91,9 +89,8 @@ Use `--port` to override when needed, but keep this mapping as the standard to a
 - Do not push app changes directly to `main` during normal work.
 - Standard flow:
   1. Create a local feature branch from updated `main`.
-  2. Make and test changes locally in `backtest_dev.py` and/or `backtest_staging.py`.
-  3. Copy approved changes into `backtest_prod.py` only when ready for production.
-  4. Commit the branch, push it to GitHub, open a PR, and merge into `main`.
-  5. On Lightsail, `git checkout main && git pull --ff-only origin main`, then restart services.
+  2. Make and review changes locally in `backtest_prod.py` against a local database.
+  3. Commit the branch, push it to GitHub, open a PR, and merge into `main`.
+  4. On Lightsail, `git checkout main && git pull --ff-only origin main`, then restart the web service.
 - Keep the server repo on `main` after deployment.
 - Emergency direct pushes to `main` are allowed only when explicitly intended, and should be treated as exceptions.

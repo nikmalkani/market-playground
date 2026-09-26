@@ -15,17 +15,6 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from .config import Settings
-from .tracking import (
-    METRICS_HTML,
-    build_common_legs_payload,
-    build_overview_payload,
-    build_recent_runs_payload,
-    build_timeseries_payload,
-    ensure_tracking_db,
-    insert_tracking_event,
-    parse_metrics_date_range,
-)
-
 _PROD_SHARE_DB_URL_ENV = "STRATEGY_SHARE_DB_URL"
 _PROD_SHARE_DB_DEFAULT_URL = "sqlite:///strategy_shares.db"
 _MAX_STRATEGY_SHARE_BODY_BYTES = 1_500_000
@@ -97,10 +86,6 @@ def _html_response(handler: BaseHTTPRequestHandler, html: str) -> None:
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
-
-
-def _render_app_html(*, tracking_enabled: bool) -> str:
-    return _HTML.replace("__TRACKING_ENABLED__", "true" if tracking_enabled else "false")
 
 
 def _connect_options_db(db_path: Path) -> sqlite3.Connection:
@@ -1162,21 +1147,12 @@ def _get_qs(params: dict[str, list[str]], key: str, default: str | None = None) 
 class SqlUiHandler(BaseHTTPRequestHandler):
     db_path: Path
     share_db_path: Path | None = None
-    tracking_db_path: Path | None = None
-    tracking_enabled: bool = False
-    tracking_metrics_enabled: bool = False
 
     def do_GET(self) -> None:  # noqa: N802
         path, qs = _get_query_params(self.path)
 
         if path == "/":
-            _html_response(self, _render_app_html(tracking_enabled=self.tracking_enabled))
-            return
-        if path == "/ops/metrics":
-            if not self.tracking_metrics_enabled:
-                _json_response(self, {"error": "not_found"}, status=404)
-                return
-            _html_response(self, METRICS_HTML)
+            _html_response(self, _HTML)
             return
         if path == "/api/health":
             _json_response(self, {"ok": True})
@@ -1196,66 +1172,6 @@ class SqlUiHandler(BaseHTTPRequestHandler):
                     return
                 payload["share_url"] = _build_strategy_share_url(
                     self, payload["share_token"]
-                )
-                _json_response(self, payload)
-            except Exception as exc:
-                _error_response(self, str(exc))
-            return
-        if path == "/api/ops/metrics/overview":
-            if not self.tracking_metrics_enabled or self.tracking_db_path is None:
-                _json_response(self, {"error": "not_found"}, status=404)
-                return
-            try:
-                from_date, to_date = parse_metrics_date_range(
-                    _get_qs(qs, "from"), _get_qs(qs, "to")
-                )
-                payload = build_overview_payload(
-                    self.tracking_db_path, from_date=from_date, to_date=to_date
-                )
-                _json_response(self, payload)
-            except Exception as exc:
-                _error_response(self, str(exc))
-            return
-        if path == "/api/ops/metrics/timeseries":
-            if not self.tracking_metrics_enabled or self.tracking_db_path is None:
-                _json_response(self, {"error": "not_found"}, status=404)
-                return
-            try:
-                from_date, to_date = parse_metrics_date_range(
-                    _get_qs(qs, "from"), _get_qs(qs, "to")
-                )
-                payload = build_timeseries_payload(
-                    self.tracking_db_path, from_date=from_date, to_date=to_date
-                )
-                _json_response(self, payload)
-            except Exception as exc:
-                _error_response(self, str(exc))
-            return
-        if path == "/api/ops/metrics/runs":
-            if not self.tracking_metrics_enabled or self.tracking_db_path is None:
-                _json_response(self, {"error": "not_found"}, status=404)
-                return
-            try:
-                from_date, to_date = parse_metrics_date_range(
-                    _get_qs(qs, "from"), _get_qs(qs, "to")
-                )
-                payload = build_recent_runs_payload(
-                    self.tracking_db_path, from_date=from_date, to_date=to_date
-                )
-                _json_response(self, payload)
-            except Exception as exc:
-                _error_response(self, str(exc))
-            return
-        if path == "/api/ops/metrics/common-legs":
-            if not self.tracking_metrics_enabled or self.tracking_db_path is None:
-                _json_response(self, {"error": "not_found"}, status=404)
-                return
-            try:
-                from_date, to_date = parse_metrics_date_range(
-                    _get_qs(qs, "from"), _get_qs(qs, "to")
-                )
-                payload = build_common_legs_payload(
-                    self.tracking_db_path, from_date=from_date, to_date=to_date
                 )
                 _json_response(self, payload)
             except Exception as exc:
@@ -1402,7 +1318,6 @@ class SqlUiHandler(BaseHTTPRequestHandler):
         if path not in {
             "/api/options/strategy-history",
             "/api/options/strategy-plan",
-            "/api/track",
             "/api/strategy-shares",
         }:
             _json_response(self, {"error": "not_found"}, status=404)
@@ -1420,13 +1335,6 @@ class SqlUiHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(raw_len).decode("utf-8")
             parsed = json.loads(body)
 
-            if path == "/api/track":
-                if not self.tracking_enabled or self.tracking_db_path is None:
-                    _json_response(self, {"error": "tracking_disabled"}, status=404)
-                    return
-                payload = insert_tracking_event(self.tracking_db_path, parsed)
-                _json_response(self, payload, status=202)
-                return
             if path == "/api/strategy-shares":
                 if self.share_db_path is None:
                     _json_response(self, {"error": "not_found"}, status=404)
@@ -1510,17 +1418,9 @@ def main() -> None:
         raise FileNotFoundError(f"SQLite DB not found at {db_path}")
     ensure_option_query_performance(db_path)
     share_db_path = ensure_strategy_share_db(_share_db_url())
-    tracking_db_path = None
-    if settings.tracking_enabled or settings.tracking_metrics_enabled:
-        tracking_db_path = ensure_tracking_db(settings.tracking_db_url)
 
     SqlUiHandler.db_path = db_path
     SqlUiHandler.share_db_path = share_db_path
-    SqlUiHandler.tracking_db_path = tracking_db_path
-    SqlUiHandler.tracking_enabled = bool(settings.tracking_enabled and tracking_db_path)
-    SqlUiHandler.tracking_metrics_enabled = bool(
-        settings.tracking_metrics_enabled and tracking_db_path
-    )
     server = ThreadingHTTPServer((args.host, args.port), SqlUiHandler)
     print(f"Backtest prod UI running at http://{args.host}:{args.port} using {db_path}")
     server.serve_forever()
@@ -2408,6 +2308,7 @@ _HTML = """<!doctype html>
               </div>
               <datalist id="strategySnapshotToDateList"></datalist>
             </div>
+            <div class="meta" style="grid-column: 1 / -1; margin-top:-8px;">Starts with the latest 20 recorded sessions. Expand the dates to analyze more history.</div>
             <div>
               <label>&nbsp;</label><br/>
               <button id="strategyResolveBtn" class="run-analysis-wide">Add leg</button>
@@ -2500,14 +2401,9 @@ _HTML = """<!doctype html>
     const MAX_ANALYZER_SELECTED_CONTRACTS = 4;
     const MAX_STRATEGY_RESOLVED_CONTRACTS = 50;
     const MAX_STRATEGY_ANALYSIS_STREAMERS = 120;
+    const DEFAULT_STRATEGY_LOOKBACK_SESSIONS = 20;
     const MAX_TABLE_RENDER_ROWS = 1000;
     const MINUTE_DIFF_LABEL = 60;
-    const TRACKING_ENABLED = __TRACKING_ENABLED__;
-    const TRACKING_ANON_KEY = "marketplayground_tracking_anonymous_id";
-    const TRACKING_SESSION_KEY = "marketplayground_tracking_session_id";
-    const TRACKING_LAST_SEEN_KEY = "marketplayground_tracking_last_seen_at";
-    const TRACKING_IDLE_MS = 30 * 60 * 1000;
-    const trackingFallbackStore = {};
 
     const strategyState = {
       symbol: "SPX",
@@ -2541,104 +2437,19 @@ _HTML = """<!doctype html>
       lastMeta: "",
     };
 
-    function trackingRead(key) {
-      try {
-        return window.localStorage.getItem(key) || trackingFallbackStore[key] || "";
-      } catch {
-        return trackingFallbackStore[key] || "";
-      }
-    }
-
-    function trackingWrite(key, value) {
-      trackingFallbackStore[key] = value;
-      try {
-        window.localStorage.setItem(key, value);
-      } catch {}
-    }
-
-    function randomTrackingId() {
-      if (window.crypto && typeof window.crypto.randomUUID === "function") {
-        return window.crypto.randomUUID();
-      }
-      return `mp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-    }
-
-    function getAnonymousTrackingId() {
-      let current = trackingRead(TRACKING_ANON_KEY);
-      if (current) return current;
-      current = randomTrackingId();
-      trackingWrite(TRACKING_ANON_KEY, current);
-      return current;
-    }
-
-    function getTrackingSessionId() {
-      const now = Date.now();
-      const current = trackingRead(TRACKING_SESSION_KEY);
-      const lastSeenRaw = trackingRead(TRACKING_LAST_SEEN_KEY);
-      const lastSeen = parseInt(lastSeenRaw || "0", 10);
-      const needsRefresh = !current || !Number.isFinite(lastSeen) || now - lastSeen > TRACKING_IDLE_MS;
-      const next = needsRefresh ? randomTrackingId() : current;
-      trackingWrite(TRACKING_SESSION_KEY, next);
-      trackingWrite(TRACKING_LAST_SEEN_KEY, String(now));
-      return next;
-    }
-
-    function getTrackingReferrerHost() {
-      try {
-        if (!document.referrer) return "";
-        return new URL(document.referrer).host || "";
-      } catch {
-        return "";
-      }
-    }
-
-    function sanitizeTrackingLeg(leg) {
-      return {
-        side: String(leg.side || "").toUpperCase(),
-        option_type: String(leg.option_type || "").toUpperCase(),
-        target_delta: leg.target_delta == null ? null : Number(leg.target_delta),
-        target_dte: leg.target_dte == null ? null : Number(leg.target_dte),
-        quantity: leg.quantity == null ? 1 : Number(leg.quantity),
-        entry_time: String(leg.entry_time || ""),
-        snapshot_from_date: String(leg.snapshot_from_date || ""),
-        snapshot_to_date: String(leg.snapshot_to_date || ""),
-      };
-    }
-
-    function currentStrategyLegsForTracking() {
-      return strategyState.legs.map((leg) => sanitizeTrackingLeg(leg));
-    }
-
-    function currentStrategyRunTrackingPayload() {
-      const symbol = document.getElementById("strategySymbol")?.value || "SPX";
-      const snapshotDates = Array.isArray(strategyState.snapshotDates) ? strategyState.snapshotDates : [];
-      const snapshotFromDate = document.getElementById("strategySnapshotFromDate")?.value || "";
-      const snapshotToDate = document.getElementById("strategySnapshotToDate")?.value || "";
-      return {
-        symbol,
-        legs: currentStrategyLegsForTracking(),
-        leg_count: strategyState.legs.length,
-        snapshot_from_date: snapshotFromDate || snapshotDates[0] || "",
-        snapshot_to_date: snapshotToDate || snapshotDates[snapshotDates.length - 1] || "",
-        hold_till_expiry: Boolean(document.getElementById("strategyHoldToExpiry")?.checked),
-        exit_days: parseInt(document.getElementById("strategyExitDays")?.value || "0", 10),
-        exit_time: document.getElementById("strategyExitTime")?.value || "",
-      };
-    }
-
     function cloneJsonSafe(value) {
       return JSON.parse(JSON.stringify(value));
     }
 
     function currentStrategyDefinitionPayload() {
-      const base = currentStrategyRunTrackingPayload();
+      const snapshotDates = Array.isArray(strategyState.snapshotDates) ? strategyState.snapshotDates : [];
       return {
-        symbol: base.symbol,
-        snapshot_from_date: base.snapshot_from_date,
-        snapshot_to_date: base.snapshot_to_date,
-        hold_till_expiry: base.hold_till_expiry,
-        exit_days: base.exit_days,
-        exit_time: base.exit_time,
+        symbol: document.getElementById("strategySymbol")?.value || "SPX",
+        snapshot_from_date: document.getElementById("strategySnapshotFromDate")?.value || snapshotDates[0] || "",
+        snapshot_to_date: document.getElementById("strategySnapshotToDate")?.value || snapshotDates[snapshotDates.length - 1] || "",
+        hold_till_expiry: Boolean(document.getElementById("strategyHoldToExpiry")?.checked),
+        exit_days: parseInt(document.getElementById("strategyExitDays")?.value || "0", 10),
+        exit_time: document.getElementById("strategyExitTime")?.value || "",
         legs: strategyState.legs.map((leg) => ({
           side: String(leg.side || "").toUpperCase(),
           quantity: leg.quantity == null ? 1 : Number(leg.quantity),
@@ -2654,17 +2465,6 @@ _HTML = """<!doctype html>
           resolved_contracts: Array.isArray(leg.resolved_contracts) ? cloneJsonSafe(leg.resolved_contracts) : [],
         })),
       };
-    }
-
-    function currentStrategyShareTrackingPayload(extra) {
-      const stats = summarizeStrategyTrades(strategyState.historyRows || []);
-      return Object.assign({}, currentStrategyRunTrackingPayload(), {
-        result_origin: strategyState.resultsOrigin || "live",
-        source_share_token: strategyState.loadedShareToken || "",
-        is_dirty_since_share_load: Boolean(strategyState.isDirtySinceShareLoad),
-        completed_trade_count: stats.tradeCount || 0,
-        history_row_count: Array.isArray(strategyState.historyRows) ? strategyState.historyRows.length : 0,
-      }, extra || {});
     }
 
     function buildStrategySharePayload() {
@@ -2686,44 +2486,6 @@ _HTML = """<!doctype html>
           source_share_token: strategyState.loadedShareToken || "",
         },
       };
-    }
-
-    function trackEvent(eventName, data, outcome) {
-      if (!TRACKING_ENABLED) return Promise.resolve(null);
-      const payload = {
-        event_name: eventName,
-        event_version: 1,
-        anonymous_id: getAnonymousTrackingId(),
-        session_id: getTrackingSessionId(),
-        page_path: window.location.pathname || "/",
-        referrer_host: getTrackingReferrerHost(),
-        occurred_at: new Date().toISOString(),
-        data: data && typeof data === "object" ? data : {},
-      };
-      if (outcome) payload.outcome = outcome;
-      const body = JSON.stringify(payload);
-      try {
-        if (navigator.sendBeacon) {
-          const blob = new Blob([body], { type: "application/json" });
-          if (navigator.sendBeacon("/api/track", blob)) {
-            return Promise.resolve(true);
-          }
-        }
-      } catch {}
-      return fetch("/api/track", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-        keepalive: true,
-      }).catch(() => null);
-    }
-
-    function trackPageView() {
-      trackEvent("page_view", { title: document.title });
-    }
-
-    function trackStrategyShareResult(outcome, extra) {
-      return trackEvent("strategy_share_result", currentStrategyShareTrackingPayload(extra), outcome);
     }
 
     function escapeHtml(v) {
@@ -3178,16 +2940,6 @@ _HTML = """<!doctype html>
       refreshStrategyRunButtonVisibility();
     }
 
-    function trackStrategyLegResult(outcome, payload, extra) {
-      const merged = Object.assign({}, payload || {}, extra || {});
-      return trackEvent("strategy_leg_add_result", merged, outcome);
-    }
-
-    function trackStrategyRunResult(outcome, extra) {
-      const merged = Object.assign({}, currentStrategyRunTrackingPayload(), extra || {});
-      return trackEvent("strategy_run_result", merged, outcome);
-    }
-
     async function resolveStrategyLeg() {
       const meta = document.getElementById("strategyBuilderMeta");
       const symbol = document.getElementById("strategySymbol").value || "SPX";
@@ -3201,53 +2953,38 @@ _HTML = """<!doctype html>
       const snapshotDates = Array.isArray(strategyState.snapshotDates) ? strategyState.snapshotDates : [];
       const hasSnapshotDate = (value) => !value || snapshotDates.includes(value);
       const roundedTargetDelta = Number.isFinite(targetDelta) ? Math.round(targetDelta) : null;
-      const trackingPayload = {
-        symbol,
-        side,
-        option_type: optionType,
-        target_delta: roundedTargetDelta,
-        target_dte: Number.isFinite(dte) ? dte : null,
-        entry_time: entryTime,
-        snapshot_from_date: snapshotFromDate,
-        snapshot_to_date: snapshotToDate,
-      };
-      trackEvent("strategy_leg_add_attempt", trackingPayload);
 
-      function fail(message, reason, outcome = "validation_error", extra = {}) {
+      function fail(message) {
         meta.textContent = message;
         meta.className = "meta danger";
-        trackStrategyLegResult(outcome, trackingPayload, Object.assign({ reason }, extra));
       }
 
       if (!entryTime) {
-        fail("Entry Time is required.", "missing_entry_time");
+        fail("Entry Time is required.");
         return;
       }
       if (!Number.isFinite(dte) || dte < 0) {
-        fail("DTE must be a non-negative integer.", "invalid_dte");
+        fail("DTE must be a non-negative integer.");
         return;
       }
       if (!Number.isFinite(targetDelta) || targetDelta <= 0) {
-        fail("Delta must be > 0.", "invalid_delta");
+        fail("Delta must be > 0.");
         return;
       }
       if (!snapshotDates.length) {
-        fail("No snapshot dates available for this symbol.", "no_snapshot_dates");
+        fail("No snapshot dates available for this symbol.");
         return;
       }
       if (!hasSnapshotDate(snapshotFromDate) || !hasSnapshotDate(snapshotToDate)) {
         fail(
-          "Choose Snapshot From/To dates from the available snapshot dates.",
-          "invalid_snapshot_dates"
+          "Choose Snapshot From/To dates from the available snapshot dates."
         );
         return;
       }
       const effectiveFromDate = snapshotFromDate || snapshotDates[0];
       const effectiveToDate = snapshotToDate || snapshotDates[snapshotDates.length - 1];
-      trackingPayload.snapshot_from_date = effectiveFromDate;
-      trackingPayload.snapshot_to_date = effectiveToDate;
       if (effectiveFromDate > effectiveToDate) {
-        fail("Snapshot From must not be after Snapshot To.", "invalid_snapshot_range");
+        fail("Snapshot From must not be after Snapshot To.");
         return;
       }
       if (hasMatchingStrategyLeg({
@@ -3260,8 +2997,7 @@ _HTML = """<!doctype html>
         snapshot_to_date: effectiveToDate,
       })) {
         fail(
-          "You already have a leg with matching criteria added. Feel free to adjust the quantity.",
-          "duplicate_leg"
+          "You already have a leg with matching criteria added. Feel free to adjust the quantity."
         );
         return;
       }
@@ -3286,15 +3022,12 @@ _HTML = """<!doctype html>
         if (!res.ok || !resolvedContracts.length) {
           fail(
             "Could not resolve leg: " + (payload.error || "no match found."),
-            payload.error || "no_match_found",
-            "no_match"
           );
           return;
         }
 
         const keptContracts = resolvedContracts.slice(0, MAX_STRATEGY_RESOLVED_CONTRACTS);
         if (!keptContracts.length) {
-          trackStrategyLegResult("no_match", trackingPayload, { reason: "no_kept_contracts" });
           meta.textContent = "";
           meta.className = "meta";
           renderStrategyLegsTable();
@@ -3318,13 +3051,9 @@ _HTML = """<!doctype html>
         markStrategyDirtyFromShare();
         meta.textContent = "";
         meta.className = "meta";
-        trackStrategyLegResult("success", trackingPayload, {
-          matched_count: Number(payload.count) > 0 ? Number(payload.count) : keptContracts.length,
-          resolved_count: keptContracts.length,
-        });
         renderStrategyLegsTable();
       } catch {
-        fail("Could not resolve leg: request failed.", "request_failed", "error");
+        fail("Could not resolve leg: request failed.");
       }
     }
 
@@ -4312,7 +4041,6 @@ _HTML = """<!doctype html>
     async function runStrategyAnalysis() {
       const meta = document.getElementById("strategyAnalysisMeta");
       const resolvedLegs = strategyState.legs.filter((leg) => leg.isResolved && Array.isArray(leg.resolved_contracts) && leg.resolved_contracts.length > 0);
-      trackEvent("strategy_run_attempt", currentStrategyRunTrackingPayload());
       if (!resolvedLegs.length) {
         setStrategyResultsVisibility(false);
         meta.textContent = "Please resolve at least one leg.";
@@ -4320,7 +4048,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("validation_error", { reason: "no_resolved_legs" });
         return;
       }
 
@@ -4338,7 +4065,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("validation_error", { reason: "no_snapshot_dates" });
         return;
       }
       const fromDate = snapshotFromDate || allDates[0];
@@ -4352,7 +4078,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("validation_error", { reason: "invalid_snapshot_range" });
         return;
       }
       if (!holdTillExpiry && (!Number.isFinite(exitDays) || exitDays < 0)) {
@@ -4362,7 +4087,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("validation_error", { reason: "invalid_exit_days" });
         return;
       }
       if (!holdTillExpiry && !exitTime) {
@@ -4372,7 +4096,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("validation_error", { reason: "missing_exit_time" });
         return;
       }
       const exitMinutes = holdTillExpiry ? null : parseHmToMinutes(exitTime);
@@ -4383,7 +4106,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("validation_error", { reason: "invalid_exit_time" });
         return;
       }
       if (!holdTillExpiry && exitDays === 0 && latestEntryTime != null && exitMinutes <= latestEntryTime) {
@@ -4393,7 +4115,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("validation_error", { reason: "exit_not_after_entry" });
         return;
       }
       const tradeDates = allDates.filter((d) => d >= fromDate && d <= toDate);
@@ -4404,7 +4125,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("empty", { reason: "no_trade_dates" });
         return;
       }
 
@@ -4434,10 +4154,6 @@ _HTML = """<!doctype html>
           renderStrategyStats([]);
           renderStrategySeriesTable([]);
           renderStrategyIndexChart([]);
-          trackStrategyRunResult("error", {
-            reason: planPayload.error || "strategy_plan_error",
-            trade_dates_count: tradeDates.length,
-          });
           return;
         }
         const tradePlans = Array.isArray(planPayload.trade_plans) ? planPayload.trade_plans : [];
@@ -4449,11 +4165,6 @@ _HTML = """<!doctype html>
           renderStrategyStats([]);
           renderStrategySeriesTable([]);
           renderStrategyIndexChart([]);
-          trackStrategyRunResult("empty", {
-            reason: "no_trade_plans",
-            trade_dates_count: tradeDates.length,
-            skipped_dates: skippedDates,
-          });
           return;
         }
 
@@ -4465,11 +4176,6 @@ _HTML = """<!doctype html>
           renderStrategyStats([]);
           renderStrategySeriesTable([]);
           renderStrategyIndexChart([]);
-          trackStrategyRunResult("empty", {
-            reason: "no_streamers",
-            trade_plan_count: tradePlans.length,
-            skipped_dates: skippedDates,
-          });
           return;
         }
         if (streamers.length > MAX_STRATEGY_ANALYSIS_STREAMERS) {
@@ -4479,12 +4185,6 @@ _HTML = """<!doctype html>
           renderStrategyStats([]);
           renderStrategySeriesTable([]);
           renderStrategyIndexChart([]);
-          trackStrategyRunResult("validation_error", {
-            reason: "too_many_streamers",
-            trade_plan_count: tradePlans.length,
-            completed_contract_count: streamers.length,
-            skipped_dates: skippedDates,
-          });
           return;
         }
         const seriesParams = new URLSearchParams({
@@ -4513,11 +4213,6 @@ _HTML = """<!doctype html>
           renderStrategyStats([]);
           renderStrategySeriesTable([]);
           renderStrategyIndexChart([]);
-          trackStrategyRunResult("error", {
-            reason: seriesData.error || "series_error",
-            trade_plan_count: tradePlans.length,
-            skipped_dates: skippedDates,
-          });
           return;
         }
         if (!summaryRes.ok) {
@@ -4534,11 +4229,6 @@ _HTML = """<!doctype html>
           renderStrategySeriesTable([]);
           renderStrategyTradeMatrixTable([]);
           renderStrategyIndexChart([]);
-          trackStrategyRunResult("empty", {
-            reason: "no_series_rows",
-            trade_plan_count: tradePlans.length,
-            skipped_dates: skippedDates,
-          });
           return;
         }
         const transformed = transformStrategySeriesRows(rows, summaryData.market_series || [], tradePlans, { holdTillExpiry, exitDays, exitTime });
@@ -4550,13 +4240,6 @@ _HTML = """<!doctype html>
           renderStrategySeriesTable([]);
           renderStrategyTradeMatrixTable([]);
           renderStrategyIndexChart([]);
-          trackStrategyRunResult("empty", {
-            reason: "no_completed_trades",
-            trade_plan_count: tradePlans.length,
-            trade_dates_count: tradeDates.length,
-            series_rows_count: rows.length,
-            skipped_dates: skippedDates,
-          });
           return;
         }
         const completedTradeCount = new Set(transformed.map((row) => row.trade_index).filter((value) => value != null)).size;
@@ -4568,14 +4251,6 @@ _HTML = """<!doctype html>
         applyStrategyResults(transformed, { origin: "live" });
         meta.textContent = "";
         meta.className = "meta";
-        trackStrategyRunResult("success", {
-          trade_dates_count: tradeDates.length,
-          trade_plan_count: tradePlans.length,
-          completed_trade_count: completedTradeCount,
-          completed_contract_count: completedContracts,
-          series_rows_count: rows.length,
-          skipped_dates: skippedDates,
-        });
       } catch {
         setStrategyResultsVisibility(false);
         meta.textContent = "Request failed while running strategy.";
@@ -4583,7 +4258,6 @@ _HTML = """<!doctype html>
         renderStrategyStats([]);
         renderStrategySeriesTable([]);
         renderStrategyIndexChart([]);
-        trackStrategyRunResult("error", { reason: "request_failed" });
       }
     }
 
@@ -4670,7 +4344,11 @@ _HTML = """<!doctype html>
           toEl.min = dates[0];
           toEl.max = dates[dates.length - 1];
           if (!dates.includes(fromEl.value)) {
-            fromEl.value = dates[0];
+            const defaultFromIndex = Math.max(
+              0,
+              dates.length - DEFAULT_STRATEGY_LOOKBACK_SESSIONS
+            );
+            fromEl.value = dates[defaultFromIndex];
           }
           if (!dates.includes(toEl.value)) {
             toEl.value = dates[dates.length - 1];
@@ -4704,7 +4382,6 @@ _HTML = """<!doctype html>
       if (!button || !strategyState.hasCompletedResults || !Array.isArray(strategyState.historyRows) || !strategyState.historyRows.length) {
         return;
       }
-      trackEvent("strategy_share_attempt", currentStrategyShareTrackingPayload());
       button.disabled = true;
       setStrategyShareFeedback("Creating share link...", "");
       try {
@@ -4717,7 +4394,6 @@ _HTML = """<!doctype html>
         if (!response.ok || !payload.share_url) {
           const reason = payload && payload.error ? String(payload.error) : "request_failed";
           setStrategyShareFeedback(`Could not create share link: ${reason}.`, "danger");
-          trackStrategyShareResult("error", { reason });
           return;
         }
         let copied = false;
@@ -4732,13 +4408,8 @@ _HTML = """<!doctype html>
           "success",
           String(payload.share_url)
         );
-        trackStrategyShareResult("success", {
-          share_token: String(payload.share_token || ""),
-          copied_to_clipboard: copied,
-        });
       } catch {
         setStrategyShareFeedback("Could not create share link: request failed.", "danger");
-        trackStrategyShareResult("error", { reason: "request_failed" });
       } finally {
         updateStrategyShareControls();
       }
@@ -4799,7 +4470,6 @@ _HTML = """<!doctype html>
             meta.textContent = `Could not load shared strategy: ${reason}.`;
             meta.className = "meta danger";
           }
-          trackEvent("strategy_share_open", { share_token: shareToken, reason }, "error");
           return;
         }
         applySharedStrategyDefinition(payload.strategy || {});
@@ -4818,17 +4488,11 @@ _HTML = """<!doctype html>
           meta.textContent = "Shared strategy loaded. Edit the strategy or rerun it locally to refresh the results.";
           meta.className = "meta success";
         }
-        trackEvent(
-          "strategy_share_open",
-          currentStrategyShareTrackingPayload({ share_token: String(payload.share_token || shareToken) }),
-          "success"
-        );
       } catch {
         if (meta) {
           meta.textContent = "Could not load shared strategy: request failed.";
           meta.className = "meta danger";
         }
-        trackEvent("strategy_share_open", { share_token: shareToken, reason: "request_failed" }, "error");
       }
     }
 
@@ -5382,7 +5046,6 @@ _HTML = """<!doctype html>
       initStrategyTab();
       initAnalyzerTab();
       await loadSharedStrategyFromUrl();
-      trackPageView();
     }
 
     initPage();

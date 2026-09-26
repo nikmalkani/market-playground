@@ -1,94 +1,79 @@
 # Architecture
 
-This repo has three connected layers:
+The project has one data collection path and one web app. The same web app runs
+locally for review and on the production host.
 
-- a collector that fetches SPX spot/options data from Tastytrade
-- SQLite or Postgres storage for normalized market snapshots
-- Python HTTP apps that expose local and public strategy tooling
-- sanitized deployment templates so the repo can be shared without exposing live host details
-
-## High-Level Flow
+## Data and request flow
 
 ```mermaid
 flowchart LR
-    A["CLI: spx-collector\nmain.py"] --> B["Modes\nrun-once / daemon / diagnose-spot / run-options-only"]
-    B --> C["Scheduler\nscheduler.py"]
-    B --> D["Collector\ncollector.py"]
-    R["Config\nconfig.py + .env"] --> B
-    R --> D
-
-    D --> E["Tastytrade auth session"]
-    D --> F["Market data APIs\nspot + metrics + options"]
-    D --> G["DXLink streamer\nquotes + greeks"]
-    E --> F
-    E --> G
-    F --> H["Normalize snapshot data"]
-    G --> H
-    H --> I["SQLAlchemy models\nmodels.py"]
-    S["DB setup\ndb.py"] --> J["Database\nSQLite or Postgres"]
-    I --> J
-
-    J --> K["Local app: backtest_dev.py\n127.0.0.1:8787"]
-    J --> L["Local app: backtest_staging.py\n127.0.0.1:8788"]
-    J --> M["Prod app: backtest_prod.py\n127.0.0.1:8789"]
-
-    N["Local browser"] --> K
-    N --> L
-
-    O["Public browser\nyour-domain.example"] --> P["Caddy reverse proxy\nports 80/443"]
-    P --> Q["systemd: spx-backtest-prod.service"]
-    Q --> M
-    D --> T["systemd: spx-collector.service"]
-
-    J --> U["Shared SQLite file on Lightsail\nprod app + collector"]
-    U --> M
-    U --> T
+    A[spx-collector CLI] --> B[scheduler.py]
+    A --> C[collector.py]
+    B --> C
+    C --> D[Tastytrade REST and DXLink]
+    D --> E[models.py]
+    E --> F[(SQLite snapshot database)]
+    G[Local browser] --> H[backtest_prod.py on 127.0.0.1:8789]
+    I[Public browser] --> J[Caddy on 80/443]
+    J --> K[systemd production service]
+    K --> H2[backtest_prod.py on 127.0.0.1:8789]
+    H --> F
+    H2 --> F
+    C -. writes .-> F
+    F -. daily backup timer .-> L[(SQLite backup)]
 ```
 
-## Runtime Paths
+### Collection
 
-### 1. Collector path
+- `src/spx_collector/main.py` provides `run-once`, `daemon`, `diagnose-spot`,
+  and `run-options-only` commands.
+- `src/spx_collector/scheduler.py` schedules weekday snapshots from 06:00 to
+  14:00 Pacific, every 15 minutes.
+- `src/spx_collector/collector.py` authenticates with Tastytrade, fetches market
+  data and metrics, selects option contracts, streams quotes and Greeks, and
+  writes snapshots.
+- `src/spx_collector/models.py` defines the snapshot tables. `db.py` creates
+  them and applies the small SQLite compatibility migration.
 
-- `src/spx_collector/main.py` is the CLI entrypoint.
-- `src/spx_collector/scheduler.py` controls timed collection runs.
-- `src/spx_collector/collector.py` authenticates, fetches market data, streams greeks, normalizes records, and writes snapshots.
-- `src/spx_collector/models.py` and `src/spx_collector/db.py` define and initialize storage.
+### Web app
 
-### 2. Local UI path
+- `src/spx_collector/backtest_prod.py` is the only web application. Run it locally
+  against a local database to review changes; production runs the same module
+  against the production database.
+- Python HTTP handlers query SQLite and return curated JSON. The browser never
+  connects directly to the database, and there is no raw SQL execution route.
+- The app uses a separate SQLite file for strategy shares.
 
-- `src/spx_collector/backtest_dev.py` is the local dev playground.
-- `src/spx_collector/backtest_staging.py` is the local staging playground.
-- `backtest_dev.py` also serves `/api/query` for SQL Lab and keeps `/api/schema`/`/api/health` for diagnostics.
-- `backtest_staging.py` and `backtest_prod.py` intentionally omit raw SQL execution, keeping only curated endpoints and tracking/health surfaces.
-- The browser talks to Python handlers first, then those handlers query the database.
+### Production and backup
 
-### 3. Public website path
+The public request path is:
 
-- `src/spx_collector/backtest_prod.py` is the public website app.
-- In production it can run behind `deploy/systemd/spx-backtest-prod.service`.
-- `deploy/caddy/public-site.example.Caddyfile` is a sanitized example that reverse proxies a public domain to `127.0.0.1:8789`.
-- The public request path is:
+`Browser -> Caddy -> systemd service -> backtest_prod.py -> SQLite`
 
-`Browser -> Caddy -> backtest_prod.py -> SQLite`
+Caddy terminates public HTTP/HTTPS and proxies to the app on loopback. The
+checked-in systemd examples cover the web app and SQLite backup timer. The
+collector service referenced by the deployment docs is installed separately on
+the production host.
 
-Operator setup details live in [lightsail_prod_setup.md](/Users/nikhilmalkani/Desktop/Projects/historical%20spx%20data/docs/lightsail_prod_setup.md).
+The backup script makes an initial consistent SQLite copy, then appends newer
+rows from the two snapshot tables. It is intended for append-only snapshots and
+is not a full backup of the strategy-share database.
 
-## Current Design Tradeoffs
+## Local review and deployment
 
-- The three backtest apps duplicate a large amount of Python and inline frontend code.
-- Frontend HTML, CSS, and JS live inside Python `_HTML` strings, which keeps deployment simple but makes UI maintenance harder.
-- The public prod app and collector currently share the same SQLite file on the Lightsail instance. That keeps the stack simple, but it also means prod read latency can be affected by database shape, payload size, and collector/server contention.
+1. Run `backtest_prod.py` locally on port 8789, using a local database and an
+   owner-only `.env` file.
+2. Review the changed flow locally, then merge the feature branch to `main`.
+3. Fast-forward the production checkout to `main` and restart the production
+   service.
 
-## Deployment Workflow
+Production host paths and operator steps are in
+[lightsail_prod_setup.md](lightsail_prod_setup.md).
 
-- Treat the local repo as the source of truth.
-- Use Lightsail as a deploy target, not the primary edit surface.
-- Normal workflow is: test locally in dev/staging, promote approved changes into `backtest_prod.py`, merge to `main`, then fast-forward the server repo and restart services.
+## Current tradeoffs
 
-## Likely Cleanup Path
-
-If this grows further, the highest-value cleanup path is:
-
-1. share more server logic across `backtest_dev.py`, `backtest_staging.py`, and `backtest_prod.py`
-2. move frontend assets out of Python strings
-3. keep env-specific files as thin wrappers over shared handlers and UI modules
+- The HTML, CSS, and JavaScript are embedded in one large Python string. Moving
+  those assets into separate files is a later cleanup, after the product workflow
+  is clearer.
+- The production app and collector share a SQLite file on the host. Query load,
+  database size, and collector writes can affect response time.

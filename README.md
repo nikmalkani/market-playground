@@ -5,8 +5,8 @@ Market Playground is a Python project for collecting SPX spot and options snapsh
 The repo has three main pieces:
 
 - a collector that pulls SPX market and options data on a schedule
-- local HTTP apps for development and staging analysis
-- a production-oriented HTTP app that can be served behind a reverse proxy
+- one HTTP app for local review and production
+- deployment and backup configuration for the public service
 
 ## What It Does
 
@@ -83,23 +83,20 @@ The scheduler only runs during this window:
 
 `run-once` uses the same time-window check. For an off-hours test, use the forced snapshot command below.
 
-## Running The UIs
+## Running The App Locally
 
-App roles:
-
-- `src/spx_collector/backtest_dev.py`: local dev UI, default port `8787`
-- `src/spx_collector/backtest_staging.py`: local staging UI, default port `8788`
-- `src/spx_collector/backtest_prod.py`: production-oriented UI, default port `8789`
-
-Start them with:
+Run the same app locally that is served in production. Set `DB_URL` in `.env` to
+the local SQLite database you want to inspect. The app requires `.env` to be
+owner-readable only:
 
 ```bash
-PYTHONPATH=src python -m spx_collector.backtest_dev
-PYTHONPATH=src python -m spx_collector.backtest_staging
-PYTHONPATH=src python -m spx_collector.backtest_prod
+chmod 600 .env
+PYTHONPATH=src python -m spx_collector.backtest_prod --host 127.0.0.1 --port 8789
 ```
 
-All three apps read through Python HTTP handlers. The browser does not connect to SQLite directly.
+Open `http://127.0.0.1:8789`. The browser talks to Python HTTP handlers; it does
+not connect to SQLite directly. Review changes locally, then merge to `main` and
+deploy through the production service workflow below.
 
 ## Data Model
 
