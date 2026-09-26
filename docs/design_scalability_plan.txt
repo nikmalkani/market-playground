@@ -7,7 +7,7 @@ This document explains, in simple terms, how to move from the current embedded-H
 
 Current Situation
 
-Right now, the UI for `backtest_staging.py` is built like this:
+Right now, the UI for `backtest_prod.py` is built like this:
 
 - Python serves one large HTML string
 - CSS is written manually inside that Python file
@@ -204,7 +204,7 @@ Recommended Practical Path for This Repo
 
 If the goal is a scalable UI system, the recommended order is:
 
-1. Extract the current page from `backtest_staging.py`
+1. Extract the current page from `backtest_prod.py`
 2. Create a small frontend structure
 3. Install Tailwind properly
 4. Rebuild the existing playground using Tailwind classes
